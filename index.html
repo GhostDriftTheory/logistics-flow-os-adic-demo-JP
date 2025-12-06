@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GhostDrift Logistics OS Demo</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel (TypeScript & JSX Compiler) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <style>
+        /* カスタムアニメーション設定 */
+        @keyframes fade-in {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes slide-in-from-bottom-4 {
+            from { transform: translateY(1rem); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .animate-in {
+            animation-duration: 0.5s;
+            animation-fill-mode: both;
+        }
+        .fade-in {
+            animation-name: fade-in;
+        }
+        .slide-in-from-bottom-4 {
+            animation-name: slide-in-from-bottom-4;
+        }
+        .preserve-3d {
+            transform-style: preserve-3d;
+        }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="typescript,react">
+        const { useState, useMemo, useEffect } = React;
+
+        // --- Types & Interfaces ---
+        type AdicPhase = "normal" | "trouble" | "ghostdrift";
+
+        interface AdicLedgerEntry {
+            stepId: number;
+            timeLabel: string;
+            operation: string;
+            inputs: string;
+            deltaPosLowerBound: string;
+            verifOk: boolean;
+        }
+
+        type AdicInput = {
+            phase: AdicPhase;
+            deltaPos: number;
+            demandSpike?: number;
+            marginB?: number;
+            marginB_gd?: number;
+            recoverAmount?: number;
+        };
+
+        // --- Logic Functions ---
+
+        function buildAdicLedgerDemo(input: AdicInput): AdicLedgerEntry[] {
+            switch (input.phase) {
+                case "normal": {
+                    return [{
+                        stepId: 1,
+                        timeLabel: "t0",
+                        operation: "init_network()",
+                        inputs: "stockA=100, stockB=80, stockC=60",
+                        deltaPosLowerBound: "7/20",
+                        verifOk: true,
+                    }];
+                }
+                case "trouble": {
+                    const boundT = input.deltaPos.toFixed(2);
+                    return [
+                        {
+                            stepId: 10,
+                            timeLabel: "t1",
+                            operation: "inject_demand()",
+                            inputs: `spike=${input.demandSpike}, margin=${input.marginB}`,
+                            deltaPosLowerBound: boundT,
+                            verifOk: true,
+                        },
+                        {
+                            stepId: 11,
+                            timeLabel: "t1",
+                            operation: "inject_delay()",
+                            inputs: "route=A-B, delay=40",
+                            deltaPosLowerBound: boundT,
+                            verifOk: true,
+                        },
+                    ];
+                }
+                case "ghostdrift": {
+                    const boundG = input.deltaPos.toFixed(2);
+                    return [
+                        {
+                            stepId: 20,
+                            timeLabel: "t2",
+                            operation: "move_stock(C->B)",
+                            inputs: `amt=${input.recoverAmount}`,
+                            deltaPosLowerBound: boundG,
+                            verifOk: true,
+                        },
+                        {
+                            stepId: 21,
+                            timeLabel: "t2",
+                            operation: "move_stock(A->B)",
+                            inputs: "amt=5",
+                            deltaPosLowerBound: boundG,
+                            verifOk: true,
+                        },
+                        {
+                            stepId: 22,
+                            timeLabel: "t2",
+                            operation: "reroute(A->C->B)",
+                            inputs: `margin=${input.marginB_gd}`,
+                            deltaPosLowerBound: boundG,
+                            verifOk: true,
+                        },
+                    ];
+                }
+                default: {
+                    return [];
+                }
+            }
+        }
+
+        type Step = "step1" | "step2" | "step3";
+        type RiskLevel = "green" | "yellow" | "red" | "orange";
+
+        interface Warehouse {
+            id: "A" | "B" | "C";
+            name: string;
+            stock: number;
+            stockMin: number;
+            stockMax: number;
+            riskLevel: RiskLevel;
+            statusText: string;
+        }
+
+        interface Truck {
+            id: string;
+            from: "A" | "B" | "C";
+            to: "A" | "B" | "C";
+            riskLevel: RiskLevel;
+            active: boolean;
+        }
+
+        interface Route {
+            id: string;
+            from: "A" | "B" | "C";
+            to: "A" | "B" | "C";
+            riskLevel: RiskLevel;
+            dashed?: boolean;
+        }
+
+        interface TimeSeriesPoint {
+            time: string;
+            value: number;
+            phase: AdicPhase;
+        }
+
+        interface AppState {
+            phase: AdicPhase;
+            healthScore: number;
+            deltaPos: number;
+            warehouses: Warehouse[];
+            trucks: Truck[];
+            routes: Route[];
+            message: string;
+            ledger: AdicLedgerEntry[];
+            timeSeries: TimeSeriesPoint[];
+            nodeMargins: { node: string; margin: number; status: RiskLevel }[];
+        }
+
+        const calculateState = (step: Step, demandSpike: number, isTroubleTriggered: boolean): AppState => {
+            const initStockB = 80;
+            const stockMinB = 40;
+
+            const consumedBySpike = Math.round(initStockB * (demandSpike / 100));
+            const stockB_trouble = Math.max(0, initStockB - consumedBySpike);
+            const marginB = stockB_trouble - stockMinB;
+
+            const safetyBuffer = 15;
+            const targetStockB = Math.min(120, Math.max(stockB_trouble, stockMinB + safetyBuffer));
+            const requiredRecovery = Math.max(0, targetStockB - stockB_trouble);
+            const recoverAmount = requiredRecovery > 5 ? requiredRecovery - 5 : 0;
+
+            const stockB_gd = targetStockB;
+            const marginB_gd = stockB_gd - stockMinB;
+
+            const generateTimeSeries = (currentPhase: AdicPhase): TimeSeriesPoint[] => {
+                let dp_trouble = 0.35;
+                if (marginB < -10) { dp_trouble = 0.02; }
+                else if (marginB < 0) { dp_trouble = 0.08; }
+                else if (marginB < 15) { dp_trouble = 0.15; }
+
+                const dp_gd = marginB_gd > 5 ? 0.25 : 0.12;
+
+                return [
+                    { time: "t0", value: 0.35, phase: "normal" },
+                    { time: "t1", value: dp_trouble, phase: "trouble" },
+                    { time: "t2", value: dp_gd, phase: "ghostdrift" },
+                ];
+            };
+
+            if (step === "step1" && !isTroubleTriggered) {
+                const ts = generateTimeSeries("normal");
+                return {
+                    phase: "normal",
+                    healthScore: 85,
+                    deltaPos: 0.35,
+                    message: "システムは正常稼働中です。負荷テストを開始してください。",
+                    warehouses: [
+                        { id: "A", name: "倉庫A", stock: 100, stockMin: 40, stockMax: 120, riskLevel: "green", statusText: "正常" },
+                        { id: "B", name: "倉庫B", stock: 80, stockMin: 40, stockMax: 120, riskLevel: "green", statusText: "正常" },
+                        { id: "C", name: "倉庫C", stock: 60, stockMin: 30, stockMax: 120, riskLevel: "green", statusText: "正常" },
+                    ],
+                    trucks: [
+                        { id: "T1", from: "A", to: "B", riskLevel: "green", active: true },
+                        { id: "T2", from: "B", to: "C", riskLevel: "green", active: true },
+                        { id: "T3", from: "C", to: "A", riskLevel: "green", active: true },
+                    ],
+                    routes: [
+                        { id: "A-B", from: "A", to: "B", riskLevel: "green" },
+                        { id: "B-C", from: "B", to: "C", riskLevel: "green" },
+                        { id: "C-A", from: "C", to: "A", riskLevel: "green" },
+                    ],
+                    ledger: buildAdicLedgerDemo({ phase: "normal", deltaPos: 0.35 }),
+                    timeSeries: ts,
+                    nodeMargins: [
+                        { node: "倉庫 A", margin: 60, status: "green" },
+                        { node: "倉庫 B", margin: 40, status: "green" },
+                        { node: "倉庫 C", margin: 30, status: "green" },
+                    ],
+                };
+            }
+
+            let riskB: RiskLevel = "green";
+            let healthScore = 85;
+            let deltaPos = 0.35;
+            let statusTextB = "正常";
+
+            if (marginB < -10) {
+                riskB = "red";
+                healthScore = 20;
+                deltaPos = 0.02;
+                statusTextB = "枯渇";
+            } else if (marginB < 0) {
+                riskB = "red";
+                healthScore = 40;
+                deltaPos = 0.08;
+                statusTextB = "不足";
+            } else if (marginB < 15) {
+                riskB = "yellow";
+                healthScore = 65;
+                deltaPos = 0.15;
+                statusTextB = "注意";
+            }
+
+            if (step === "step1") {
+                return {
+                    phase: "trouble",
+                    healthScore,
+                    deltaPos,
+                    message: riskB === "red"
+                        ? "警告：従来型AIでは対応限界。倉庫Bで在庫不足が発生しています。"
+                        : "注意：需要急増により在庫が圧迫されています。",
+                    warehouses: [
+                        { id: "A", name: "倉庫A", stock: 100, stockMin: 40, stockMax: 120, riskLevel: "green", statusText: "正常" },
+                        { id: "B", name: "倉庫B", stock: stockB_trouble, stockMin: 40, stockMax: 120, riskLevel: riskB, statusText: statusTextB },
+                        { id: "C", name: "倉庫C", stock: 60, stockMin: 30, stockMax: 120, riskLevel: "green", statusText: "正常" },
+                    ],
+                    trucks: [
+                        { id: "T1", from: "A", to: "B", riskLevel: "red", active: true },
+                        { id: "T2", from: "B", to: "C", riskLevel: "yellow", active: true },
+                        { id: "T3", from: "C", to: "A", riskLevel: "green", active: true },
+                    ],
+                    routes: [
+                        { id: "A-B", from: "A", to: "B", riskLevel: "orange" },
+                        { id: "B-C", from: "B", to: "C", riskLevel: "yellow" },
+                        { id: "C-A", from: "C", to: "A", riskLevel: "green" },
+                    ],
+                    ledger: buildAdicLedgerDemo({ phase: "trouble", deltaPos, demandSpike, marginB }),
+                    timeSeries: generateTimeSeries("trouble"),
+                    nodeMargins: [
+                        { node: "倉庫 B", margin: marginB, status: riskB },
+                        { node: "ルート A-B", margin: -10, status: "orange" },
+                        { node: "車両 #1", margin: -5, status: "red" },
+                    ],
+                };
+            }
+
+            const healthScoreGD = marginB_gd > 5 ? 75 : 60;
+            const deltaPosGD = marginB_gd > 5 ? 0.25 : 0.12;
+
+            const gdMessage = "次世代AIが安全余力(δ)を確保。ルートと在庫を自律的に再構成しました。";
+
+            return {
+                phase: "ghostdrift",
+                healthScore: healthScoreGD,
+                deltaPos: deltaPosGD,
+                message: gdMessage,
+                warehouses: [
+                    { id: "A", name: "倉庫A", stock: 95, stockMin: 40, stockMax: 120, riskLevel: "green", statusText: "融通" },
+                    { id: "B", name: "倉庫B", stock: stockB_gd, stockMin: 40, stockMax: 120, riskLevel: "green", statusText: "回復" },
+                    { id: "C", name: "倉庫C", stock: 60 - recoverAmount, stockMin: 30, stockMax: 120, riskLevel: "yellow", statusText: "融通" },
+                ],
+                trucks: [
+                    { id: "T1", from: "A", to: "C", riskLevel: "yellow", active: true },
+                    { id: "T2", from: "B", to: "C", riskLevel: "yellow", active: true },
+                    { id: "T3", from: "C", to: "A", riskLevel: "green", active: true },
+                    { id: "T4", from: "C", to: "B", riskLevel: "yellow", active: true },
+                ],
+                routes: [
+                    { id: "A-B", from: "A", to: "B", riskLevel: "orange" },
+                    { id: "B-C", from: "B", to: "C", riskLevel: "yellow" },
+                    { id: "C-A", from: "C", to: "A", riskLevel: "green" },
+                    { id: "A-C", from: "A", to: "C", riskLevel: "yellow", dashed: true },
+                    { id: "C-B", from: "C", to: "B", riskLevel: "yellow", dashed: true },
+                ],
+                ledger: buildAdicLedgerDemo({ phase: "ghostdrift", deltaPos: deltaPosGD, marginB_gd, recoverAmount }),
+                timeSeries: generateTimeSeries("ghostdrift"),
+                nodeMargins: [
+                    { node: "倉庫 B", margin: marginB_gd, status: "green" },
+                    { node: "倉庫 C", margin: 30 - recoverAmount, status: "yellow" },
+                    { node: "ルート A-C-B", margin: 5, status: "yellow" },
+                ],
+            };
+        };
+
+        // --- Components ---
+
+        const StepNavigation = ({ currentStep, setStep }) => {
+            const steps = [
+                {
+                    id: "step1",
+                    title: "フェーズ 1",
+                    subtitle: "従来型AIの限界",
+                    desc: "統計的予測の脆弱性",
+                    color: "border-rose-500",
+                    text: "text-rose-700",
+                    bg: "bg-rose-50",
+                    activeShadow: "shadow-rose-100",
+                },
+                {
+                    id: "step2",
+                    title: "フェーズ 2",
+                    subtitle: "次世代AIの解決",
+                    desc: "数理証明による自律調整",
+                    color: "border-indigo-500",
+                    text: "text-indigo-700",
+                    bg: "bg-indigo-50",
+                    activeShadow: "shadow-indigo-100",
+                },
+                {
+                    id: "step3",
+                    title: "フェーズ 3",
+                    subtitle: "検証と証明",
+                    desc: "Σ₁台帳による透明化",
+                    color: "border-amber-500",
+                    text: "text-amber-700",
+                    bg: "bg-amber-50",
+                    activeShadow: "shadow-amber-100",
+                },
+            ];
+
+            return (
+                <div className="grid grid-cols-3 gap-2 md:gap-4 mb-4 w-full">
+                    {steps.map((s) => {
+                        const isActive = currentStep === s.id;
+                        return (
+                            <button
+                                key={s.id}
+                                onClick={() => setStep(s.id)}
+                                className={`relative p-2 md:p-3 rounded-xl border flex flex-col items-center justify-center transition-all duration-300 overflow-hidden min-w-0 ${
+                                    isActive
+                                        ? `bg-white ${s.color} ring-2 ring-offset-1 ring-offset-slate-50 ${s.text.replace("text-", "ring-")} shadow-lg ${s.activeShadow} scale-105 z-10`
+                                        : "bg-white border-slate-200 text-slate-400 hover:bg-slate-50 hover:border-slate-300 hover:text-slate-500"
+                                }`}
+                            >
+                                <span className={`text-[9px] md:text-[10px] font-bold tracking-widest mb-0.5 md:mb-1 whitespace-nowrap ${isActive ? s.text : "text-slate-400"}`}>{s.title}</span>
+                                <span className={`text-[10px] md:text-sm font-bold leading-tight whitespace-nowrap text-slate-700 w-full truncate`}>{s.subtitle}</span>
+                                <span className="hidden md:block text-[9px] text-slate-500 mt-0.5">{s.desc}</span>
+                            </button>
+                        );
+                    })}
+                </div>
+            );
+        };
+
+        const DeltaPosChart = ({ data, currentPhase, isVerified }) => {
+            const width = 100;
+            const height = 60;
+            const points = data.map((d, i) => {
+                const x = (i / (data.length - 1)) * width;
+                const y = height - (d.value * 0.8 + 0.1) * height;
+                return `${x},${y}`;
+            }).join(" ");
+
+            const strokeColor = isVerified ? "#10b981" : "#94a3b8";
+            const areaColor = isVerified ? "rgba(16, 185, 129, 0.1)" : "rgba(148, 163, 184, 0.1)";
+
+            return (
+                <div className="relative w-full h-32 bg-white rounded-lg border border-slate-200 p-2 flex flex-col justify-between shadow-sm">
+                    <div className="absolute top-2 left-2 text-[10px] text-slate-500 font-bold whitespace-nowrap">
+                        安全余力 (δ) 推移
+                    </div>
+                    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-full overflow-visible preserve-3d">
+                        <line x1="0" y1={height * 0.2} x2={width} y2={height * 0.2} stroke="#e2e8f0" strokeWidth="0.5" strokeDasharray="2" />
+                        <line x1="0" y1={height * 0.5} x2={width} y2={height * 0.5} stroke="#e2e8f0" strokeWidth="0.5" strokeDasharray="2" />
+                        <line x1="0" y1={height * 0.8} x2={width} y2={height * 0.8} stroke="#e2e8f0" strokeWidth="0.5" strokeDasharray="2" />
+
+                        <polyline points={points} fill="none" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="transition-all duration-1000" />
+                        <polygon points={`${points} ${width},${height} 0,${height}`} fill={areaColor} className="transition-all duration-1000" />
+
+                        {data.map((d, i) => {
+                            const x = (i / (data.length - 1)) * width;
+                            const y = height - (d.value * 0.8 + 0.1) * height;
+                            const isActive = (currentPhase === "normal" && i === 0) || (currentPhase === "trouble" && i === 1) || (currentPhase === "ghostdrift" && i === 2);
+                            return (
+                                <circle
+                                    key={i}
+                                    cx={x}
+                                    cy={y}
+                                    r={isActive ? 3 : 1.5}
+                                    fill={isActive ? (isVerified ? "#10b981" : "#fff") : strokeColor}
+                                    stroke={isActive ? "#fff" : "none"}
+                                    strokeWidth="1"
+                                    className="transition-all duration-500"
+                                />
+                            );
+                        })}
+                    </svg>
+                    <div className="flex justify-between text-[8px] text-slate-400 font-mono uppercase px-1">
+                        <span>t0:正常</span>
+                        <span>t1:異常</span>
+                        <span>t2:回復</span>
+                    </div>
+                </div>
+            );
+        };
+
+        const ExpertDashboard = ({ state, isVerified, viewMode }) => {
+            if (!viewMode) { return null; }
+
+            return (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                    <div className="space-y-2">
+                        <h4 className="text-xs font-bold text-slate-600 flex items-center gap-2 whitespace-nowrap">
+                            <span className={`w-1.5 h-1.5 rounded-full ${isVerified ? "bg-emerald-500" : "bg-slate-400"}`} />
+                            安全余力(δ)モニタ
+                        </h4>
+                        <DeltaPosChart data={state.timeSeries} currentPhase={state.phase} isVerified={isVerified} />
+
+                        <div className="grid grid-cols-2 gap-2 mt-2">
+                            <div className="bg-white p-2 rounded border border-slate-200 shadow-sm min-w-0">
+                                <div className="text-[9px] text-slate-500 whitespace-nowrap">現在の下限保証値</div>
+                                <div className={`text-lg font-mono font-bold truncate ${isVerified ? "text-emerald-600" : "text-slate-700"}`}>
+                                    {state.deltaPos.toFixed(2)}
+                                </div>
+                            </div>
+                            <div className="bg-white p-2 rounded border border-slate-200 shadow-sm min-w-0">
+                                <div className="text-[9px] text-slate-500 whitespace-nowrap">数理検証ステータス</div>
+                                <div className={`text-xs font-bold mt-1 whitespace-nowrap ${isVerified ? "text-emerald-600" : "text-slate-400"}`}>
+                                    {isVerified ? "証明済み (Verified)" : "未検証"}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="space-y-2">
+                        <h4 className="text-xs font-bold text-slate-600 flex items-center gap-2 whitespace-nowrap">
+                            <span className={`w-1.5 h-1.5 rounded-full ${isVerified ? "bg-emerald-500" : "bg-slate-400"}`} />
+                            技術比較 & ノード解析
+                        </h4>
+
+                        <div className="overflow-x-auto rounded border border-slate-200 bg-white shadow-sm">
+                            <table className="w-full text-[9px] md:text-[10px] text-left whitespace-nowrap">
+                                <thead className="bg-slate-50 text-slate-600 border-b border-slate-100">
+                                    <tr>
+                                        <th className="p-1.5 pl-2 font-medium">項目</th>
+                                        <th className="p-1.5 font-medium">従来型AI</th>
+                                        <th className="p-1.5 text-indigo-700 font-bold bg-indigo-50/50">次世代AI (GhostDrift)</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100 text-slate-600">
+                                    <tr>
+                                        <td className="p-1.5 pl-2 text-slate-500">最適化手法</td>
+                                        <td className="p-1.5">統計的予測</td>
+                                        <td className="p-1.5 bg-indigo-50/30 text-slate-800 font-medium">数理的下限保証 (δ)</td>
+                                    </tr>
+                                    <tr>
+                                        <td className="p-1.5 pl-2 text-slate-500">透明性</td>
+                                        <td className="p-1.5">ブラックボックス</td>
+                                        <td className="p-1.5 bg-indigo-50/30 text-slate-800 font-medium">Σ₁台帳による証明</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div className="mt-2 space-y-1">
+                            {state.nodeMargins.map((nm, i) => (
+                                <div
+                                    key={i}
+                                    className={`flex justify-between items-center px-2 py-1.5 rounded border text-[10px] whitespace-nowrap transition-all ${
+                                        isVerified ? "bg-white border-slate-200 shadow-sm" : "bg-slate-50 border-slate-100 text-slate-400"
+                                    }`}
+                                >
+                                    <span className="text-slate-700 font-medium truncate max-w-[80px] md:max-w-none">{nm.node}</span>
+                                    <div className="flex items-center gap-2">
+                                        <span className="font-mono text-slate-500">余力: {nm.margin}</span>
+                                        <span
+                                            className={`px-1.5 rounded text-[9px] font-bold ${
+                                                nm.status === "red"
+                                                    ? "bg-rose-100 text-rose-600 border border-rose-200"
+                                                    : nm.status === "yellow"
+                                                    ? "bg-amber-100 text-amber-600 border border-amber-200"
+                                                    : nm.status === "orange"
+                                                    ? "bg-orange-100 text-orange-600 border border-orange-200"
+                                                    : "bg-emerald-100 text-emerald-600 border border-emerald-200"
+                                            }`}
+                                        >
+                                            {nm.status === "green" ? "良好" : nm.status === "yellow" ? "注意" : nm.status === "red" ? "危険" : "警告"}
+                                        </span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const RouteLineWrapper = ({ route }) => {
+            const pos = {
+                A: { top: "15%", left: "15%" },
+                B: { top: "15%", left: "85%" },
+                C: { top: "85%", left: "50%" },
+            };
+
+            const p1 = pos[route.from];
+            const p2 = pos[route.to];
+
+            let color = "bg-slate-300";
+            if (route.riskLevel === "red") color = "bg-rose-500";
+            else if (route.riskLevel === "yellow") color = "bg-amber-400";
+            else if (route.riskLevel === "orange") color = "bg-orange-500";
+            else if (route.riskLevel === "green") color = "bg-emerald-500";
+
+            const borderStyle = route.dashed
+                ? `border-b-2 border-dashed ${route.riskLevel === "yellow" ? "border-amber-400" : "border-slate-400"} bg-transparent h-2`
+                : `h-1 ${color} opacity-80`;
+
+            const x1 = parseFloat(p1.left);
+            const y1 = parseFloat(p1.top);
+            const x2 = parseFloat(p2.left);
+            const y2 = parseFloat(p2.top);
+
+            const length = Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2));
+            const angle = Math.atan2(y2 - y1, x2 - x1) * (180 / Math.PI);
+
+            return (
+                <div
+                    className={`absolute origin-top-left transition-all duration-700 ${borderStyle} ${route.dashed ? "animate-pulse" : ""}`}
+                    style={{
+                        top: p1.top,
+                        left: p1.left,
+                        width: `${length}%`,
+                        transform: `rotate(${angle}deg)`,
+                    }}
+                />
+            );
+        };
+
+        const TruckWrapper = ({ truck, phase }) => {
+            const pos = { A: { x: 15, y: 15 }, B: { x: 85, y: 15 }, C: { x: 50, y: 85 } };
+            const p1 = pos[truck.from];
+            const p2 = pos[truck.to];
+
+            const t = phase === "normal" ? 0.3 : phase === "trouble" ? 0.6 : 0.8;
+
+            const x = p1.x + (p2.x - p1.x) * t;
+            const y = p1.y + (p2.y - p1.y) * t;
+
+            const color =
+                truck.riskLevel === "red"
+                    ? "bg-rose-500 text-white animate-bounce shadow-lg shadow-rose-200"
+                    : truck.riskLevel === "yellow"
+                    ? "bg-amber-400 text-slate-800 shadow-lg shadow-amber-100"
+                    : "bg-emerald-100 text-emerald-800 border border-emerald-200 shadow-lg shadow-emerald-50";
+
+            return (
+                <div
+                    className={`absolute w-6 h-4 md:w-8 md:h-6 rounded shadow-md flex items-center justify-center text-[8px] md:text-[10px] font-bold transition-all duration-1000 z-10 ${color}`}
+                    style={{ top: `${y}%`, left: `${x}%`, transform: "translate(-50%, -50%)" }}
+                >
+                    {truck.id}
+                </div>
+            );
+        };
+
+        const WarehouseNode = ({ w, positionClass }) => {
+            const ratio = Math.min(100, Math.max(0, (w.stock / w.stockMax) * 100));
+
+            let colorClass = "bg-emerald-500";
+            if (w.riskLevel === "red") colorClass = "bg-rose-500 animate-pulse";
+            if (w.riskLevel === "yellow") colorClass = "bg-amber-400";
+
+            return (
+                <div className={`absolute ${positionClass} flex flex-col items-center z-20 transition-all duration-700`}>
+                    <div className="relative w-14 h-14 md:w-20 md:h-20 bg-white rounded-xl border border-slate-200 overflow-hidden shadow-lg">
+                        <div className="absolute inset-0 opacity-10 bg-[radial-gradient(circle_at_2px_2px,#cbd5e1_1px,transparent_0)] bg-[length:8px_8px]" />
+
+                        <div
+                            className={`absolute bottom-0 left-0 w-full transition-all duration-700 ease-out opacity-90 ${colorClass}`}
+                            style={{ height: `${ratio}%` }}
+                        />
+
+                        <div className="absolute inset-0 flex flex-col items-center justify-center">
+                            <span className="text-[10px] md:text-xs font-bold text-slate-700 tracking-wider mix-blend-multiply">{w.name}</span>
+                            <span className="text-[9px] md:text-[10px] font-mono text-slate-600 bg-white/80 px-1.5 py-0.5 rounded-full mt-0.5 shadow-sm border border-slate-100">
+                                {w.stock}/{w.stockMax}
+                            </span>
+                        </div>
+                    </div>
+
+                    <div
+                        className={`mt-2 px-2 py-0.5 rounded-full text-[9px] font-bold border whitespace-nowrap shadow-sm ${
+                            w.riskLevel === "red"
+                                ? "bg-rose-50 text-rose-600 border-rose-200"
+                                : w.riskLevel === "yellow"
+                                ? "bg-amber-50 text-amber-600 border-amber-200"
+                                : "bg-emerald-50 text-emerald-600 border-emerald-200"
+                        }`}
+                    >
+                        {w.statusText}
+                    </div>
+                </div>
+            );
+        };
+
+        const LogisticsDemo = () => {
+            const [currentStep, setStep] = useState("step1");
+            const [demandSpike, setDemandSpike] = useState(45);
+            const [isTroubleTriggered, setIsTroubleTriggered] = useState(false);
+            const [isVerified, setIsVerified] = useState(false);
+            const [isVerifying, setIsVerifying] = useState(false);
+
+            const isExpertMode = currentStep === "step3";
+
+            const state = useMemo(() => calculateState(currentStep, demandSpike, isTroubleTriggered), [currentStep, demandSpike, isTroubleTriggered]);
+
+            const warehouseB = state.warehouses.find((w) => w.id === "B");
+            const stockBNow = warehouseB?.stock ?? 0;
+            const marginBNow = warehouseB ? warehouseB.stock - warehouseB.stockMin : 0;
+
+            useEffect(() => {
+                if (currentStep !== "step3") {
+                    setIsVerified(false);
+                    setIsVerifying(false);
+                }
+            }, [currentStep]);
+
+            const handleTriggerTrouble = () => {
+                setIsTroubleTriggered(true);
+            };
+
+            const handleReset = () => {
+                setIsTroubleTriggered(false);
+                setStep("step1");
+            };
+
+            const handleVerify = () => {
+                if (isVerified) return;
+                setIsVerifying(true);
+                setTimeout(() => {
+                    setIsVerifying(false);
+                    setIsVerified(true);
+                }, 1200);
+            };
+
+            const gaugeColor = state.healthScore >= 70 ? "bg-emerald-500" : state.healthScore >= 40 ? "bg-amber-400" : "bg-rose-500";
+
+            return (
+                <div className="w-full min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center py-4 px-3 md:py-8 md:px-6 font-sans">
+                    <div className="w-full max-w-5xl">
+                        <header className="mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+                            <div className="text-center md:text-left">
+                                <h1 className="text-xl md:text-2xl font-bold text-slate-800 tracking-tight flex flex-col md:flex-row items-center gap-1 md:gap-2 justify-center md:justify-start">
+                                    <span className="text-indigo-600 whitespace-nowrap">GhostDrift</span>
+                                    <span className="whitespace-nowrap">自律調整 物流OS</span>
+                                </h1>
+                                <p className="text-xs text-slate-500 mt-1 whitespace-nowrap">数理証明に基づく次世代の自律調整デモ</p>
+                            </div>
+                            <button
+                                onClick={handleReset}
+                                className="text-[10px] text-slate-500 border border-slate-300 bg-white rounded-full px-3 py-1 hover:bg-slate-100 transition-colors flex items-center gap-1 whitespace-nowrap shadow-sm"
+                            >
+                                <span className="text-lg leading-none">↺</span> 最初から
+                            </button>
+                        </header>
+
+                        <StepNavigation currentStep={currentStep} setStep={setStep} />
+
+                        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 md:gap-6 mb-6">
+                            <div className="lg:col-span-3 bg-white border border-slate-200 rounded-2xl p-5 flex flex-row lg:flex-col items-center justify-between shadow-sm">
+                                <div className="text-left lg:text-center">
+                                    <h3 className="text-xs font-bold text-slate-600 uppercase tracking-wider mb-1 whitespace-nowrap">稼働安定スコア</h3>
+                                    <p className="text-[10px] text-slate-400 whitespace-nowrap">システム健全性</p>
+                                </div>
+
+                                <div className="flex-1 lg:w-full flex items-center justify-center px-4 py-2 lg:py-6">
+                                    <div className="relative w-full h-3 lg:h-48 lg:w-6 bg-slate-100 rounded-full overflow-hidden">
+                                        <div
+                                            className={`absolute bottom-0 left-0 w-full lg:w-full h-full lg:h-auto transition-all duration-1000 ease-out ${gaugeColor}`}
+                                            style={{ height: `${state.healthScore}%`, width: `${state.healthScore}%` }}
+                                        />
+                                    </div>
+                                </div>
+
+                                <div className="text-right lg:text-center whitespace-nowrap">
+                                    <span
+                                        className={`text-3xl font-bold transition-colors duration-500 ${
+                                            state.healthScore > 70 ? "text-emerald-600" : state.healthScore > 40 ? "text-amber-500" : "text-rose-500"
+                                        }`}
+                                    >
+                                        {state.healthScore}
+                                    </span>
+                                    <span className="text-xs text-slate-400 ml-1">点</span>
+                                </div>
+                            </div>
+
+                            <div className="lg:col-span-9 bg-white border border-slate-200 rounded-2xl p-1 relative overflow-hidden shadow-sm min-h-[400px]">
+                                <div className="absolute inset-0 opacity-10 bg-[radial-gradient(circle_at_1px_1px,#64748b_1px,transparent_0)] bg-[length:20px_20px]" />
+
+                                <div
+                                    className={`absolute inset-0 w-full h-full transition-colors duration-1000 pointer-events-none ${
+                                        state.phase === "trouble" ? "bg-rose-50/50" : state.phase === "ghostdrift" ? "bg-indigo-50/30" : "bg-transparent"
+                                    }`}
+                                />
+
+                                <div className="relative w-full h-full min-h-[400px]">
+                                    <WarehouseNode w={state.warehouses[0]} positionClass="top-8 left-8" />
+                                    <WarehouseNode w={state.warehouses[1]} positionClass="top-8 right-8" />
+                                    <WarehouseNode w={state.warehouses[2]} positionClass="bottom-8 left-1/2 -translate-x-1/2" />
+
+                                    {state.routes.map((r) => (
+                                        <div key={r.id} className="absolute inset-0 pointer-events-none">
+                                            <RouteLineWrapper route={r} />
+                                        </div>
+                                    ))}
+
+                                    {state.trucks.map((t) => t.active && <TruckWrapper key={t.id} truck={t} phase={state.phase} />)}
+                                </div>
+
+                                <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-white/90 backdrop-blur border border-slate-200 px-4 py-2 rounded-full shadow-md flex items-center gap-3 w-[95%] md:w-auto justify-center z-30 min-w-0">
+                                    <span className="text-lg flex-shrink-0">{state.phase === "normal" ? "🟢" : state.phase === "trouble" ? "🚨" : "🛡️"}</span>
+                                    <span className="text-xs md:text-sm font-medium text-slate-700 truncate whitespace-nowrap">{state.message}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="bg-white border border-slate-200 rounded-2xl p-4 md:p-6 shadow-md transition-all duration-500">
+                            {currentStep === "step1" && (
+                                <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
+                                    <div className="mb-6 p-4 rounded-xl bg-rose-50 border border-rose-100 flex flex-col md:flex-row gap-4 items-start">
+                                        <div className="flex-shrink-0 text-3xl">🚨</div>
+                                        <div className="text-left w-full">
+                                            <h3 className="text-rose-700 font-bold text-sm mb-1 whitespace-nowrap">なぜ従来型AIは崩壊するのか？</h3>
+                                            <p className="text-[11px] md:text-xs text-rose-800/80 leading-relaxed text-justify md:text-left">
+                                                従来型AIは過去のデータに基づく「平均値」で最適化されています。 そのため、今回のような
+                                                <span className="font-bold border-b border-rose-400">想定外のスパイク（外れ値）が発生すると、計算上の安全マージンが一瞬で枯渇</span>
+                                                し、連鎖的なシステムダウンを引き起こします。
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex flex-col md:flex-row items-center gap-6">
+                                        <div className="flex-1 w-full">
+                                            <label className="text-xs font-bold text-slate-600 mb-2 block flex justify-between whitespace-nowrap">
+                                                <span>需要スパイク強度 (負荷テスト)</span>
+                                                <span className="text-rose-500 font-mono">+{demandSpike}%</span>
+                                            </label>
+                                            <input
+                                                type="range"
+                                                min="20"
+                                                max="90"
+                                                step="5"
+                                                value={demandSpike}
+                                                onChange={(e) => {
+                                                    setDemandSpike(Number(e.target.value));
+                                                    setIsTroubleTriggered(false);
+                                                }}
+                                                className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                                            />
+
+                                            <p className="mt-2 text-[10px] text-slate-500 font-mono break-words md:whitespace-nowrap bg-slate-50 p-2 rounded border border-slate-100">
+                                                設定: +{demandSpike}% → 倉庫B在庫: 80個 → <span className="font-bold text-slate-800">{stockBNow}個</span>
+                                                （安全在庫40個に対し 余裕 <span className={`font-bold ${marginBNow < 0 ? "text-rose-500" : "text-slate-800"}`}>{marginBNow}個</span>）
+                                            </p>
+
+                                            <div className="h-8 w-full mt-2 bg-slate-50 rounded flex items-end gap-1 px-1 overflow-hidden">
+                                                {[...Array(20)].map((_, i) => {
+                                                    const h = Math.min(100, 20 + Math.random() * 30 + (i > 15 ? demandSpike : 0));
+                                                    return <div key={i} className="flex-1 bg-rose-200" style={{ height: `${h}%` }} />;
+                                                })}
+                                            </div>
+                                        </div>
+                                        <div className="w-full md:w-auto border-l border-slate-100 pl-0 md:pl-6 pt-4 md:pt-0">
+                                            <button
+                                                onClick={handleTriggerTrouble}
+                                                disabled={isTroubleTriggered}
+                                                className={`w-full md:w-48 h-12 rounded-xl font-bold text-sm shadow-md transition-all whitespace-nowrap ${
+                                                    isTroubleTriggered
+                                                        ? "bg-rose-50 text-rose-400 border border-rose-100 cursor-default"
+                                                        : "bg-rose-600 text-white hover:bg-rose-500 hover:shadow-lg active:scale-95"
+                                                }`}
+                                            >
+                                                {isTroubleTriggered ? "トラブル発生中" : "⚡ 負荷実験を実行"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {currentStep === "step2" && (
+                                <div className="animate-in fade-in slide-in-from-bottom-2 duration-300 py-2">
+                                    <div className="bg-indigo-50/50 border border-indigo-100 rounded-xl p-4 md:p-6 flex flex-col md:flex-row gap-4 md:gap-6 items-start">
+                                        <div className="flex-shrink-0">
+                                            <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-white border border-indigo-200 shadow-sm text-indigo-600">
+                                                <span className="text-2xl">🛡️</span>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex-1 text-left w-full">
+                                            <h3 className="text-indigo-800 font-bold text-lg mb-2 flex items-center gap-2 whitespace-nowrap">
+                                                GhostDrift Engine Activated
+                                                <span className="text-[10px] bg-indigo-600 text-white px-2 py-0.5 rounded-full">Operational</span>
+                                            </h3>
+
+                                            <p className="text-sm text-slate-600 leading-relaxed mb-4 text-justify md:text-left">
+                                                GhostDrift Engine はネットワーク全体の
+                                                <span className="text-indigo-700 font-bold"> 安全余力 (δ)</span>
+                                                を数学的に計算し直し、 「どのルートと在庫融通パターンなら 安全余力 が 0 を下回らないか」を探索して選びます。
+                                            </p>
+
+                                            <div className="text-[11px] text-slate-500 leading-relaxed pl-3 border-l-2 border-indigo-200 text-justify md:text-left">
+                                                <p>平均値を追う従来型AIとは異なり、 「最悪のケースでもシステムを止めない」ための下限値を保証します。</p>
+                                                <p className="mt-1">
+                                                    GhostDrift は <span className="font-mono text-indigo-600 font-bold">Σ₁ 台帳</span> 上で
+                                                    <span className="font-mono"> δ ≥ δ_min </span> を満たすルートだけを選び、 その証拠を後ろの検証画面に残す点が「次世代AI」である理由です。
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {currentStep === "step3" && (
+                                <div className="space-y-6">
+                                    <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
+                                        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+                                            <div className="text-left w-full">
+                                                <h3 className="text-amber-600 font-bold text-sm flex items-center gap-2 whitespace-nowrap">
+                                                    <span className="w-2 h-2 rounded-full bg-amber-500" />
+                                                    数理証明ログ (Σ₁ Ledger)
+                                                </h3>
+                                                <div className="mt-1.5 space-y-1">
+                                                    <p className="text-[10px] text-slate-500">
+                                                        ※ この台帳は物流デモ用に簡略化した「おもちゃ版 ADIC」です。 本番の定理 1.1 のフル台帳とは仕様を分離しています。
+                                                    </p>
+                                                    <p className="text-[10px] text-slate-500">
+                                                        Verify(L) が通るとき、画面右上の 安全余力(δ) グラフは ここに記録された下限値と整合するように設計されています。
+                                                    </p>
+                                                </div>
+                                            </div>
+
+                                            <button
+                                                onClick={handleVerify}
+                                                disabled={isVerified || isVerifying}
+                                                className={`px-6 py-2 rounded-lg text-xs font-bold transition-all shadow-md whitespace-nowrap flex-shrink-0 ${
+                                                    isVerified
+                                                        ? "bg-emerald-50 text-emerald-600 border border-emerald-200 cursor-default"
+                                                        : "bg-amber-500 text-white hover:bg-amber-400 hover:shadow-lg active:scale-95"
+                                                }`}
+                                            >
+                                                {isVerifying ? "検証中..." : isVerified ? "✓ 検証完了 (Verified)" : "🔍 Verify(L) 実行"}
+                                            </button>
+                                        </div>
+
+                                        <div className="overflow-x-auto rounded-lg border border-slate-200 bg-slate-50">
+                                            <table className="w-full text-left text-[10px] md:text-xs whitespace-nowrap">
+                                                <thead className="bg-slate-100 text-slate-600 border-b border-slate-200">
+                                                    <tr>
+                                                        <th className="p-3">Step</th>
+                                                        <th className="p-3">Operation</th>
+                                                        <th className="p-3">Inputs</th>
+                                                        <th className="p-3 text-right">δ Bound</th>
+                                                        <th className="p-3 text-center">Status</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-200">
+                                                    {state.ledger.map((row) => (
+                                                        <tr key={row.stepId} className={`transition-colors duration-500 ${isVerified ? "hover:bg-emerald-50" : "hover:bg-slate-100"}`}>
+                                                            <td className="p-3 font-mono text-slate-500">{row.stepId}</td>
+                                                            <td className="p-3 font-mono text-indigo-600 font-medium">{row.operation}</td>
+                                                            <td className="p-3 text-slate-600 truncate max-w-[150px]">{row.inputs}</td>
+                                                            <td className="p-3 text-right font-mono text-amber-600">{row.deltaPosLowerBound}</td>
+                                                            <td className="p-3 text-center">
+                                                                {isVerified ? <span className="text-emerald-600 font-bold animate-in zoom-in">OK</span> : <span className="text-slate-400">-</span>}
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+
+                                    <div className="border-t border-slate-200 pt-6">
+                                        <ExpertDashboard state={state} isVerified={isVerified} viewMode={isExpertMode} />
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Mount Application ---
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<LogisticsDemo />);
+    </script>
+</body>
+</html>
